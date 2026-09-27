@@ -399,7 +399,13 @@ static void t_epoll_level_triggered(void)
 	      "注册 EPOLLOUT 后应立刻可写, ret=%d", ret);
 
 	CHECK(ioc_get_stats(fd, &st) == 0, "GET_STATS 失败");
-	CHECK(st.poll_count >= 4, "poll_count 应 >= 4, 实际 %llu", st.poll_count);
+	/*
+	 * epoll 只在"就绪链表非空"或"重新轮询状态"时才会走到驱动的 .poll，
+	 * 具体次数依赖内核实现（ep_insert/ep_send_events/ep_modify 各会调一次），
+	 * 所以这里只断言"poll 确实被 epoll 调用过多次"，不锁死精确数字。
+	 */
+	CHECK(st.poll_count >= 3,
+	      "poll_count 说明 epoll 确实调用了驱动的 poll, 实际 %llu", st.poll_count);
 
 	close(epfd);
 	close(fd);
@@ -662,11 +668,16 @@ static void t_flag_no_drop(void)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.flags = 0;
 	CHECK(ioc_set_config(fd, &cfg, &applied) == 0, "关闭 NO_DROP 失败: %s", errname());
-	n = write(fd, g_a, 4096);
-	CHECK(n == 4096, "关闭严格模式后应接受 4096, 实际 %zd (%s)", n, errname());
+	/*
+	 * 此时 used=4000、空闲 96 字节。写 200 字节需要覆盖最老的
+	 * 200-96 = 104 字节未读数据，这 104 字节要如实计入 bytes_dropped。
+	 */
+	errno = 0;
+	n = write(fd, g_a, 200);
+	CHECK(n == 200, "关闭严格模式后写 200 应返回 200, 实际 %zd (%s)", n, errname());
 	CHECK(ioc_get_stats(fd, &st) == 0, "GET_STATS 失败");
-	CHECK(st.bytes_dropped == 96,
-	      "覆盖 96 字节未读数据, bytes_dropped 应为 96, 实际 %llu",
+	CHECK(st.bytes_dropped == 104,
+	      "覆盖 104 字节未读数据, bytes_dropped 应为 104, 实际 %llu",
 	      st.bytes_dropped);
 
 	CHECK(reset_to(fd, 4096, 0, 0) == 0, "恢复默认配置失败");

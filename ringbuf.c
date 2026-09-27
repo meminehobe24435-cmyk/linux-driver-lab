@@ -8,7 +8,8 @@
 #include "ringbuf.h"
 
 #ifdef __KERNEL__
-#include <linux/string.h>
+#include <linux/string.h>	/* memcpy/memset */
+#include <linux/stddef.h>	/* NULL */
 #else
 #include <string.h>
 #endif

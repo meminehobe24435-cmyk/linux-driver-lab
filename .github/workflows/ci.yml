@@ -49,12 +49,29 @@ jobs:
       # ------------------------------------------------------------------
       - name: 编译内核模块
         run: |
+          set -o pipefail
           make 2>&1 | tee /tmp/kbuild.log
-          echo "--- 检查是否有 warning/error ---"
-          if grep -i -E 'warning:|error:' /tmp/kbuild.log; then
-            echo "错误: 内核模块编译出现 warning/error"; exit 1
+
+          echo "=== 检查本模块自身的 warning/error ==="
+          # kbuild 会打印一条 "warning: the compiler differs from the one used to
+          # build the kernel"（内核是用 x86_64-linux-gnu-gcc-13 编的，这里用的是
+          # gcc-13，版本号完全相同，只是调用路径不同）。这是工具链提示，
+          # 不是代码问题，单独排除并把原文打印出来，避免"悄悄放过 warning"。
+          echo "--- 被排除的工具链提示（如实打印） ---"
+          grep -n 'compiler differs' /tmp/kbuild.log || echo "(本次没有这条提示)"
+          echo "---------------------------------------"
+
+          set +e
+          grep -i -E 'warning:|error:' /tmp/kbuild.log \
+            | grep -v 'compiler differs' > /tmp/kbuild_warn.txt
+          set -e
+
+          if [ -s /tmp/kbuild_warn.txt ]; then
+            echo "错误: 内核模块编译出现 warning/error:"
+            cat /tmp/kbuild_warn.txt
+            exit 1
           fi
-          echo "内核模块编译零 warning 零 error"
+          echo "内核模块编译零 warning 零 error（已排除上面打印的工具链路径提示）"
           ls -l labdev.ko
           modinfo ./labdev.ko
 

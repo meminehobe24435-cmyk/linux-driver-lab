@@ -25,7 +25,18 @@
 #ifndef _LAB_RINGBUF_H
 #define _LAB_RINGBUF_H
 
-#include <stddef.h>
+/*
+ * size_t 的来源在内核态和用户态不一样：
+ *   - 内核态必须用 <linux/types.h>。kbuild 编译模块时带 -nostdinc，
+ *     <stddef.h> 这类编译器自带头文件找不到（在 6.17 上一试就报
+ *     "fatal error: stddef.h: No such file or directory"）。
+ *   - 用户态用标准的 <stddef.h>。
+ */
+#ifdef __KERNEL__
+#  include <linux/types.h>
+#else
+#  include <stddef.h>
+#endif
 
 /* 自己定义 whence，避免同时依赖 <unistd.h> 和 <linux/fs.h> */
 #define RB_SEEK_SET	0
