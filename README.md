@@ -87,6 +87,9 @@ sudo apt-get install -y build-essential linux-headers-$(uname -r) python3
 # 1. 用户态单元测试（不需要内核头文件，先跑这个最快）
 make test-host
 
+# 1b. 完整性校验器自检（同样不需要内核模块）
+python3 tools/stress.py --selftest
+
 # 2. 编译内核模块，产物是 labdev.ko
 make
 
@@ -130,12 +133,18 @@ make check    # test-host + 编译 dtest
 
 | 项目 | 本地结果 |
 | --- | --- |
-| `make test-host`（用户态环形缓冲区测试） | ✅ 全部通过 |
+| `make test-host`（用户态环形缓冲区测试） | ✅ 17/17 通过 |
+| `python3 tools/stress.py --selftest`（完整性校验器自检） | ✅ 9/9 通过 |
 | `make`（用 `linux-headers-5.15.0-194-generic` 编译） | ✅ **0 warning / 0 error**，产出 `labdev.ko`（约 350 KB） |
 | `insmod` | ❌ **失败，且这是预期结果**。本机运行的是 WSL2 定制内核 `6.18.33.2-microsoft-standard-WSL2`，而 Ubuntu 22.04 仓库里能装到的头文件是 `5.15.0-194-generic`，`vermagic` 不匹配。实际报错：<br>`module labdev: .gnu.linkonce.this_module section size must match the kernel's built struct module size at run time`<br>`insmod: ERROR: could not insert module ./labdev.ko: Invalid module format` |
 | 内核态功能测试 / 并发压测 | 本地**未做**（依赖 `insmod` 成功），全部交给 CI 在版本匹配的内核上跑 |
 
-所以：**本地只证明了"能零警告编译出模块"，内核态行为由 CI 证明。**
+所以：**本地只证明了"能零警告编译出模块"和"纯用户态逻辑正确"，内核态行为由 CI 证明。**
+
+> CI（`ubuntu-latest`，内核 `6.17.0-1022-azure`，gcc 13.3.0）跑通了全部步骤：
+> 真实 `insmod` → `/dev/labdev`（`crw------- 10, 263`）与 sysfs 出现 → `dtest` 18/18 通过
+> → 并发压测 3 阶段全通过 → `rmmod` 后模块/设备节点/sysfs 三处无残留 → `dmesg` 干净。
+> 具体数字见 GitHub Actions 的日志。
 
 ---
 
@@ -314,7 +323,28 @@ sudo ./tools/dtest /dev/labdev
 非法用户指针（`PROT_NONE` → `-EFAULT` 且读游标回滚）、`count==0`、1 MiB 超大写入短写、
 多 fd 共享缓冲区、跨 `close`/`open` 数据保留。每条断言都给 PASS/FAIL，退出码非 0 即失败。
 
-### 3. 多进程并发压测（`tools/stress.py`）—— 验证并发正确性
+### 3. 完整性校验器自检（`tools/stress.py --selftest`）—— 证明校验器能抓到损坏
+
+```bash
+python3 tools/stress.py --selftest     # 纯用户态，不需要 insmod 也不需要 root
+```
+
+为什么需要这一步：如果只报"阶段 2 发现 0 处数据损坏"，那可能是真的没坏，
+**也可能是校验器本身根本抓不到损坏**。所以这里先对校验器本身做自检 ——
+故意制造错位、位翻转、`seq` 篡改、`seq` 重复与回退，逐一确认都能被正确识别：
+
+| 自检项 | 期望 |
+| --- | --- |
+| 连续流 500 条记录 | 全部解析通过，0 错位 |
+| 按 37 字节切块投喂（记录被 `read` 边界切开） | 仍全部解析通过 |
+| 从中间砍掉 500 字节（模拟丢弃错位） | 能恢复出大部分记录，且没有坏数据 |
+| 3 个 writer 交错写入 | 300 条全部通过 |
+| payload 位翻转 | 被 crc 校验发现，判为"不是记录起点"而不是有效记录 |
+| **只改 `seq`，payload 与 crc 都不动** | 被 payload 强校验抓住（crc 自己仍然自洽，发现不了） |
+| 同一 writer `seq` 重复 / 回退 | 被顺序检查抓住 |
+| 200 轮随机增删字节的模糊测试 | 所有"校验通过"的记录都是真实记录 |
+
+### 4. 多进程并发压测（`tools/stress.py`）—— 验证并发正确性
 
 ```bash
 sudo python3 tools/stress.py --dev /dev/labdev --procs 4 --threads 2 --seconds 3
@@ -332,16 +362,21 @@ sudo python3 tools/stress.py --dev /dev/labdev --procs 4 --threads 2 --seconds 3
   真正算失败的是"crc 自洽但内容不符"这种硬损坏。
 * 输出包含吞吐量（MiB/s、条写/s、条校验/s）。
 
-### 4. CI 里怎么跑
+### 5. CI 里怎么跑
 
 `.github/workflows/ci.yml` 在 `ubuntu-latest` 上按顺序做：
-环境信息 → 装 `linux-headers-$(uname -r)` → `make test-host` → `make`（并 grep 编译日志确认无 warning）
-→ `make -C tools` → `sudo insmod` + 检查 `/dev/labdev`、`/sys/class/misc/labdev/*`、模块参数
+环境信息 → 装 `linux-headers-$(uname -r)` → `make test-host` → `stress.py --selftest`
+→ `make`（并检查编译日志里除工具链路径提示外无 warning）→ `make -C tools`
+→ `sudo insmod` + 检查 `/dev/labdev`、`/sys/class/misc/labdev/*`、模块参数
 → sysfs 读写与非法值拒绝 → `sudo ./tools/dtest` → `sudo python3 tools/stress.py`
 → `sudo rmmod` 并检查模块/设备节点/sysfs **三处都无残留** → 非法模块参数必须加载失败
 → 自定义参数重新加载并复跑 dtest → `dmesg | tail -50`。
 
 **所有步骤都不带 `|| true`**：`insmod` 失败、测试失败、`rmmod` 有残留都会让 CI 变红。
+唯一的例外是编译日志过滤时排除了 kbuild 那条
+`warning: the compiler differs from the one used to build the kernel`
+（内核用 `x86_64-linux-gnu-gcc-13` 编译、这里用 `gcc-13`，版本号完全相同，
+只是调用路径不同）—— 这一行会被原文打印出来，其余任何 warning/error 仍然让 CI 变红。
 
 ---
 
@@ -367,7 +402,7 @@ linux-driver-lab/
 └── tools/
     ├── Makefile
     ├── dtest.c              # 内核态功能测试（需 insmod）
-    └── stress.py            # 多进程/多线程并发压测 + 完整性校验
+    └── stress.py            # 并发压测 + 完整性校验；--selftest 可单独自检校验器（不需要 insmod）
 ```
 
 ---

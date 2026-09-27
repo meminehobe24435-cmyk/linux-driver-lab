@@ -550,6 +550,119 @@ def run_phase3(dev, procs, threads, seconds):
 
 
 # ---------------------------------------------------------------------------
+# 完整性校验器自检（--selftest）
+#
+# 为什么需要这一步：如果只有"阶段 2 报 0 损坏"这一个结论，那它可能是真的没坏，
+# 也可能是校验器本身根本抓不到损坏。所以这里对 Parser 单独做自检 —— 故意制造
+# 错位、位翻转、seq 篡改、重复记录，确认每一种都能被正确地识别出来。
+#
+# 本自检**不需要内核模块、不需要 root**，纯用户态逻辑验证。
+# ---------------------------------------------------------------------------
+def run_selftest():
+    checks = []
+    fails = 0
+
+    def check(ok, name, detail=''):
+        nonlocal fails
+        checks.append(ok)
+        if not ok:
+            fails += 1
+        print('[%s] %s%s' % ('PASS' if ok else 'FAIL', name,
+                             ('  -- ' + detail) if detail else ''))
+
+    print('=== labdev 完整性校验器自检（纯用户态，不需要 insmod）===\n')
+
+    stream = b''.join(make_record(0, i) for i in range(500))
+
+    # 1) 连续流
+    p = Parser(); p.feed(stream)
+    check(p.records_ok == 500 and p.bad_payload == 0 and p.bad_order == 0,
+          '连续流 500 条记录全部解析通过',
+          'records_ok=%d resyncs=%d bad_payload=%d bad_order=%d'
+          % (p.records_ok, p.resyncs, p.bad_payload, p.bad_order))
+
+    # 2) 分块投喂（模拟 read 边界把记录切开）
+    p = Parser()
+    for off in range(0, len(stream), 37):
+        p.feed(stream[off:off + 37])
+    check(p.records_ok == 500 and p.bad_payload == 0,
+          '按 37 字节切块投喂（记录被 read 边界切开）仍全部解析通过',
+          'records_ok=%d resyncs=%d' % (p.records_ok, p.resyncs))
+
+    # 3) 中间砍掉一段（模拟缓冲区满覆盖造成的错位）
+    cut = stream[:1000] + stream[1500:]
+    p = Parser(); p.feed(cut)
+    check(p.bad_payload == 0 and p.bad_order == 0 and p.records_ok >= 400,
+          '从中间砍掉 500 字节（模拟丢弃错位）后能恢复且无坏数据',
+          'records_ok=%d resyncs=%d bad_payload=%d bad_order=%d'
+          % (p.records_ok, p.resyncs, p.bad_payload, p.bad_order))
+
+    # 4) 多 writer 交错
+    mixed = b''.join(make_record(i % 3, i // 3) for i in range(300))
+    p = Parser(); p.feed(mixed)
+    check(p.records_ok == 300 and p.bad_payload == 0 and p.bad_order == 0,
+          '3 个 writer 交错写入的 300 条记录全部校验通过',
+          'records_ok=%d' % p.records_ok)
+
+    # 5) 位翻转（crc 不再自洽）必须被识别为"这里不是记录起点"
+    corrupt = bytearray(stream)
+    corrupt[20] ^= 0xFF
+    p = Parser(); p.feed(bytes(corrupt))
+    check(p.records_ok == 499 and p.resyncs >= 1 and p.bad_payload == 0,
+          '某条记录 payload 位翻转后：crc 校验发现并跳过（不是当成有效记录）',
+          'records_ok=%d resyncs=%d' % (p.records_ok, p.resyncs))
+
+    # 6) 更阴险：只改 seq，payload 和 crc 都不动（crc 只覆盖 payload），
+    #    所以 crc 自己仍然完全自洽 —— 必须由 payload 强校验抓住。
+    #    这正是 crc 之外的第二道防线的价值所在。
+    rec = make_record(7, 0)
+    tampered = rec[:4] + struct.pack('<I', 9999) + rec[8:]
+    assert len(tampered) == REC_SIZE
+    p = Parser(); p.feed(tampered + stream)
+    check(p.bad_payload == 1,
+          '篡改 seq 但 crc 仍自洽：被 payload 强校验抓住（crc 发现不了这种损坏）',
+          'bad_payload=%d records_ok=%d' % (p.bad_payload, p.records_ok))
+
+    # 7) 同一 writer 的 seq 重复/回退必须被抓住
+    p = Parser(); p.feed(make_record(0, 5) + make_record(0, 5))
+    check(p.bad_order == 1, '同一 writer 重复 seq 被顺序检查抓住',
+          'bad_order=%d' % p.bad_order)
+
+    p = Parser(); p.feed(make_record(0, 9) + make_record(0, 3))
+    check(p.bad_order == 1, '同一 writer seq 回退被顺序检查抓住',
+          'bad_order=%d' % p.bad_order)
+
+    # 8) 随机模糊：随机插入/删除字节，校验通过的记录必须都是真记录
+    import random as _random
+    rnd = _random.Random(20240927)
+    rounds_bad = 0
+    total_ok = 0
+    for _ in range(200):
+        buf = bytearray(stream)
+        for _ in range(rnd.randint(1, 6)):
+            pos = rnd.randrange(len(buf))
+            if rnd.random() < 0.5:
+                del buf[pos:pos + rnd.randint(1, 60)]
+            else:
+                buf[pos:pos] = bytes(rnd.randrange(256)
+                                     for _ in range(rnd.randint(1, 60)))
+        p = Parser(); p.feed(bytes(buf))
+        total_ok += p.records_ok
+        if p.bad_payload or p.bad_order:
+            rounds_bad += 1
+    check(rounds_bad == 0 and total_ok > 0,
+          '200 轮随机增删字节的模糊测试：校验通过的记录全部是真实记录',
+          '累计校验通过 %d 条, 出现坏数据的轮数 %d' % (total_ok, rounds_bad))
+
+    print('\n自检项: %d 个, 失败 %d 个' % (len(checks), fails))
+    if fails:
+        print('结果: FAIL')
+        return 1
+    print('结果: PASS')
+    return 0
+
+
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description='labdev 并发压测与完整性校验')
     ap.add_argument('--dev', default='/dev/labdev')
@@ -557,7 +670,12 @@ def main():
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--seconds', type=float, default=3.0)
     ap.add_argument('--bytes', type=int, default=8 * 1024 * 1024)
+    ap.add_argument('--selftest', action='store_true',
+                    help='只跑完整性校验器的自检，不需要内核模块也不需要 root')
     args = ap.parse_args()
+
+    if args.selftest:
+        return run_selftest()
 
     if not os.path.exists(args.dev):
         print('错误: %s 不存在，请先 sudo insmod labdev.ko' % args.dev)
