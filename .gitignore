@@ -1,0 +1,27 @@
+# --- 内核模块构建产物（kbuild 会生成一大堆） ---
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+*.cmd
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+*.ko.zst
+
+# --- 用户态构建产物 ---
+tools/dtest
+tests/ringbuf_test
+*.dSYM/
+
+# --- 编辑器 / 系统 ---
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+compile_commands.json

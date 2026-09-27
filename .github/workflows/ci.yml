@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: 编译 + 加载 + 功能测试 + 并发压测
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 打印环境信息
+        run: |
+          set -x
+          uname -a
+          cat /etc/os-release
+          gcc --version | head -1
+          make --version | head -1
+          python3 --version
+          whoami
+          sudo -n true && echo "sudo 可用（免密）"
+
+      - name: 安装编译工具链与匹配当前内核的头文件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential "linux-headers-$(uname -r)"
+          echo "--- /usr/src ---"
+          ls /usr/src/
+          echo "--- 内核构建目录 ---"
+          ls -d "/lib/modules/$(uname -r)/build"
+
+      # ------------------------------------------------------------------
+      # 用户态单元测试：环形缓冲区核心逻辑（内核模块链接的是同一份 ringbuf.c）
+      # ------------------------------------------------------------------
+      - name: 用户态单元测试 (ringbuf 核心逻辑)
+        run: make test-host
+
+      # ------------------------------------------------------------------
+      # 编译内核模块
+      # ------------------------------------------------------------------
+      - name: 编译内核模块
+        run: |
+          make 2>&1 | tee /tmp/kbuild.log
+          echo "--- 检查是否有 warning/error ---"
+          if grep -i -E 'warning:|error:' /tmp/kbuild.log; then
+            echo "错误: 内核模块编译出现 warning/error"; exit 1
+          fi
+          echo "内核模块编译零 warning 零 error"
+          ls -l labdev.ko
+          modinfo ./labdev.ko
+
+      - name: 编译 tools/dtest
+        run: make -C tools
+
+      # ------------------------------------------------------------------
+      # 加载模块：这一步失败必须让 CI 变红，不做任何掩盖
+      # ------------------------------------------------------------------
+      - name: 加载模块并确认设备节点 / sysfs 出现
+        run: |
+          set -e
+          sudo insmod ./labdev.ko
+          echo "--- /proc/modules ---"
+          grep '^labdev ' /proc/modules
+          echo "--- /dev ---"
+          ls -l /dev/labdev
+          test -c /dev/labdev
+          echo "--- sysfs ---"
+          ls -l /sys/class/misc/labdev/
+          for attr in buffer_size debug stats; do
+            test -f "/sys/class/misc/labdev/$attr"
+            echo "属性 $attr 存在"
+          done
+          echo "--- 模块参数 ---"
+          for p in buf_size verbose heartbeat_ms; do
+            test -f "/sys/module/labdev/parameters/$p"
+            printf '%s = %s\n' "$p" "$(cat /sys/module/labdev/parameters/$p)"
+          done
+
+      - name: sysfs 属性读写行为检查
+        run: |
+          set -e
+          echo "buffer_size = $(cat /sys/class/misc/labdev/buffer_size)"
+          echo "debug = $(cat /sys/class/misc/labdev/debug)"
+          echo 1 | sudo tee /sys/class/misc/labdev/debug >/dev/null
+          test "$(cat /sys/class/misc/labdev/debug)" = "1"
+          echo 0 | sudo tee /sys/class/misc/labdev/debug >/dev/null
+          test "$(cat /sys/class/misc/labdev/debug)" = "0"
+          echo "debug 属性读写正常"
+          echo "stats:"; cat /sys/class/misc/labdev/stats
+          echo "--- 非法值必须被拒绝 ---"
+          if echo 2 | sudo tee /sys/class/misc/labdev/debug >/dev/null 2>&1; then
+            echo "错误: debug 属性接受了非法值 2"; exit 1
+          fi
+          echo "非法值被正确拒绝 (-EINVAL)"
+
+      # ------------------------------------------------------------------
+      # 真实内核态功能测试
+      # ------------------------------------------------------------------
+      - name: dtest 功能测试（真实内核态）
+        run: sudo ./tools/dtest /dev/labdev
+
+      # ------------------------------------------------------------------
+      # 多进程/多线程并发压测 + 数据完整性校验
+      # ------------------------------------------------------------------
+      - name: 并发压测与数据完整性校验
+        run: |
+          sudo python3 tools/stress.py --dev /dev/labdev \
+            --procs 4 --threads 2 --seconds 3 --bytes 8388608
+
+      - name: 卸载模块并确认无残留
+        run: |
+          set -e
+          sudo rmmod labdev
+          if grep -q '^labdev ' /proc/modules; then
+            echo "错误: rmmod 之后模块仍在 /proc/modules 中"; exit 1
+          fi
+          if [ -e /dev/labdev ]; then
+            echo "错误: rmmod 之后 /dev/labdev 仍然存在"; exit 1
+          fi
+          if [ -e /sys/class/misc/labdev ]; then
+            echo "错误: rmmod 之后 /sys/class/misc/labdev 仍然存在"; exit 1
+          fi
+          echo "卸载干净: 模块、设备节点、sysfs 均已消失"
+
+      # ------------------------------------------------------------------
+      # 模块参数：非法参数必须被拒绝；合法参数必须生效
+      # ------------------------------------------------------------------
+      - name: 非法的 buf_size 必须加载失败
+        run: |
+          set -e
+          if sudo insmod ./labdev.ko buf_size=100 2>/dev/null; then
+            echo "错误: buf_size=100 是非法值，模块竟然加载成功"; sudo rmmod labdev; exit 1
+          fi
+          echo "非法 buf_size 被正确拒绝"
+          if sudo insmod ./labdev.ko heartbeat_ms=999999 2>/dev/null; then
+            echo "错误: heartbeat_ms=999999 是非法值，模块竟然加载成功"; sudo rmmod labdev; exit 1
+          fi
+          echo "非法 heartbeat_ms 被正确拒绝"
+
+      - name: 用自定义模块参数重新加载并复跑 dtest (buf_size=8192, 无内核线程)
+        run: |
+          set -e
+          sudo insmod ./labdev.ko buf_size=8192 heartbeat_ms=0 verbose=1
+          test "$(cat /sys/class/misc/labdev/buffer_size)" = "8192"
+          echo "buf_size=8192 生效；heartbeat_ms=0 表示不启动内核线程"
+          sleep 1
+          sudo ./tools/dtest /dev/labdev
+          echo "--- 无内核线程时 heartbeat 应为 0 ---"
+          grep '^heartbeat=' /sys/class/misc/labdev/stats
+          sudo rmmod labdev
+
+      # ------------------------------------------------------------------
+      # 无论前面成功失败，都打印 dmesg 便于排查
+      # ------------------------------------------------------------------
+      - name: 打印 dmesg 末尾 50 行
+        if: always()
+        run: |
+          echo "===== dmesg | tail -50 ====="
+          sudo dmesg | tail -50
+
+      - name: 确保模块已卸载（清理）
+        if: always()
+        run: |
+          if grep -q '^labdev ' /proc/modules; then
+            echo "模块仍在加载中，执行卸载"
+            sudo rmmod labdev
+          fi
+          if grep -q '^labdev ' /proc/modules; then
+            echo "错误: 模块无法卸载（很可能有 fd 未关闭导致引用计数泄漏）"; exit 1
+          fi
+          echo "确认已卸载"
